@@ -168,8 +168,17 @@ package ariane_pkg;
 `endif
     localparam bit RVA = cva6_config_pkg::CVA6ConfigAExtEn; // Is A extension enabled
 
+`ifdef RVV_ARIANE
+    localparam bit RVV = `RVV_ARIANE;
+`else
+    localparam bit RVV = 1'b0;
+`endif
+
+    // Is there an accelerator enabled?
+    localparam bit ENABLE_ACCELERATOR = RVV;
+
     // Transprecision floating-point extensions configuration
-    localparam bit XF16    = cva6_config_pkg::CVA6ConfigF16En; // Is half-precision float extension (Xf16) enabled
+    localparam bit XF16    = cva6_config_pkg::CVA6ConfigF16En | RVV; // Is half-precision float extension (Xf16) enabled
     localparam bit XF16ALT = cva6_config_pkg::CVA6ConfigF16AltEn; // Is alternative half-precision float extension (Xf16alt) enabled
     localparam bit XF8     = cva6_config_pkg::CVA6ConfigF8En; // Is quarter-precision float extension (Xf8) enabled
     localparam bit XFVEC   = cva6_config_pkg::CVA6ConfigFVecEn; // Is vectorial float extension (Xfvec) enabled
@@ -216,12 +225,13 @@ package ariane_pkg;
                                      | (0   << 13)  // N - User level interrupts supported
                                      | (1   << 18)  // S - Supervisor mode implemented
                                      | (1   << 20)  // U - User mode implemented
-                                     | (NSX << 23)  // X - Non-standard extensions present
+                                     | (RVV << 21)  // V - Vector extension
+				     | (NSX << 23)  // X - Non-standard extensions present
                                      | ((riscv::XLEN == 64 ? 2 : 1) << riscv::XLEN-2);  // MXL
 
     // 32 registers + 1 bit for re-naming = 6
     localparam REG_ADDR_SIZE = 6;
-    localparam NR_WB_PORTS = 5;
+    localparam NR_WB_PORTS = 6;
 
     // Read ports for general purpose register files
     localparam NR_RGPR_PORTS = 2;
@@ -288,6 +298,34 @@ package ariane_pkg;
     localparam DATA_USER_EN = cva6_config_pkg::CVA6ConfigDataUserEn;
     localparam FETCH_USER_EN = cva6_config_pkg::CVA6ConfigFetchUserEn;
     localparam AXI_USER_EN = cva6_config_pkg::CVA6ConfigDataUserEn | cva6_config_pkg::CVA6ConfigFetchUserEn;
+
+
+    // ----------------------
+    // Accelerator Interface
+    // ----------------------
+
+    typedef struct packed {
+      riscv::instruction_t      insn;
+      riscv::xlen_t             rs1;
+      riscv::xlen_t             rs2;
+      fpnew_pkg::roundmode_e    frm;
+      logic [TRANS_ID_BITS-1:0] trans_id;
+      logic                     store_pending;
+    } accelerator_req_t;
+
+    typedef struct packed {
+      riscv::xlen_t             result;
+      logic [TRANS_ID_BITS-1:0] trans_id;
+      logic                     error;
+
+      // Metadata
+      logic                     store_pending;
+      logic                     store_complete;
+      logic                     load_complete;
+
+      logic               [4:0] fflags;
+      logic                     fflags_valid;
+    } accelerator_resp_t;
 
 
     // ---------------
@@ -381,7 +419,8 @@ package ariane_pkg;
         CSR,       // 6
         FPU,       // 7
         FPU_VEC,   // 8
-        CVXIF      // 9
+        CVXIF,     // 9
+	ACCEL	   // 10
     } fu_t;
 
     localparam EXC_OFF_RST      = 8'h80;
@@ -446,14 +485,14 @@ package ariane_pkg;
     localparam int unsigned ICACHE_SET_ASSOC   = 4; // Must be between 4 to 64
     localparam int unsigned ICACHE_INDEX_WIDTH = $clog2(CONFIG_L1I_SIZE / ICACHE_SET_ASSOC);  // in bit, contains also offset width
     localparam int unsigned ICACHE_TAG_WIDTH   = riscv::PLEN-ICACHE_INDEX_WIDTH;  // in bit
-    localparam int unsigned ICACHE_LINE_WIDTH  = 128; // in bit
+    localparam int unsigned ICACHE_LINE_WIDTH  = 256; // in bit
     localparam int unsigned ICACHE_USER_LINE_WIDTH  = (AXI_USER_WIDTH == 1) ? 4 : 128; // in bit
     // D$
     localparam int unsigned CONFIG_L1D_SIZE    = 32*1024;
     localparam int unsigned DCACHE_SET_ASSOC   = 8; // Must be between 4 to 64
     localparam int unsigned DCACHE_INDEX_WIDTH = $clog2(CONFIG_L1D_SIZE / DCACHE_SET_ASSOC);  // in bit, contains also offset width
     localparam int unsigned DCACHE_TAG_WIDTH   = riscv::PLEN-DCACHE_INDEX_WIDTH;  // in bit
-    localparam int unsigned DCACHE_LINE_WIDTH  = 128; // in bit
+    localparam int unsigned DCACHE_LINE_WIDTH  = 512; // in bit
     localparam int unsigned DCACHE_USER_LINE_WIDTH  = (AXI_USER_WIDTH == 1) ? 4 : 128; // in bit
     localparam int unsigned DCACHE_USER_WIDTH  = DATA_USER_WIDTH;
 `endif
@@ -522,8 +561,10 @@ package ariane_pkg;
                                // Shift with Add (Bitmanip)
                                SH1ADD, SH2ADD, SH3ADD,
                                // Bitmanip Logical with negate op (Bitmanip)
-                               ANDN, ORN, XNOR
-                             } fu_op;
+                               ANDN, ORN, XNOR,
+                               // Accelerator operations
+                               ACCEL_OP, ACCEL_OP_FS1, ACCEL_OP_FD, ACCEL_OP_LOAD, ACCEL_OP_STORE
+		       } fu_op;
 
     typedef struct packed {
         fu_t                      fu;
@@ -554,8 +595,9 @@ package ariane_pkg;
                 FMV_F2X,                         // FPR-GPR Moves
                 FCMP,                            // Comparisons
                 FCLASS,                          // Classifications
-                [VFMIN:VFCPKCD_D] : return 1'b1; // Additional Vectorial FP ops
-                default           : return 1'b0; // all other ops
+                [VFMIN:VFCPKCD_D],               // Additional Vectorial FP ops
+                ACCEL_OP_FS1      : return 1'b1; // Accelerator instructions
+		default           : return 1'b0; // all other ops
             endcase
         end else
             return 1'b0;
@@ -600,8 +642,9 @@ package ariane_pkg;
                 FSGNJ,                               // Sign Injections
                 FMV_X2F,                             // GPR-FPR Moves
                 [VFMIN:VFSGNJX],                     // Vectorial MIN/MAX and SGNJ
-                [VFCPKAB_S:VFCPKCD_D] : return 1'b1; // Vectorial FP cast and pack ops
-                default               : return 1'b0; // all other ops
+                [VFCPKAB_S:VFCPKCD_D],               // Vectorial FP cast and pack ops
+                ACCEL_OP_FD           : return 1'b1; // Accelerator instructions
+		default               : return 1'b0; // all other ops
             endcase
         end else
             return 1'b0;
@@ -662,6 +705,7 @@ package ariane_pkg;
         branchpredict_sbe_t       bp;            // branch predict scoreboard data structure
         logic                     is_compressed; // signals a compressed instructions, we need this information at the commit stage if
                                                  // we want jump accordingly e.g.: +4, +2
+        logic                     vfp;           // is this a vector floating-point instruction?
     } scoreboard_entry_t;
 
     // ---------------

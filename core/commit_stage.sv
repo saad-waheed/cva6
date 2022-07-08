@@ -22,6 +22,7 @@ module commit_stage import ariane_pkg::*; #(
     input  logic                                    flush_dcache_i,     // request to flush dcache -> also flush the pipeline
     output exception_t                              exception_o,        // take exception to controller
     output logic                                    dirty_fp_state_o,   // mark the F state as dirty
+    output logic                                    dirty_v_state_o,    // mark the V state as dirty
     input  logic                                    single_step_i,      // we are in single step debug mode
     // from scoreboard
     input  scoreboard_entry_t [NR_COMMIT_PORTS-1:0] commit_instr_i,     // the instruction we want to commit
@@ -45,6 +46,8 @@ module commit_stage import ariane_pkg::*; #(
     output logic                                    commit_lsu_o,       // commit the pending store
     input  logic                                    commit_lsu_ready_i, // commit buffer of LSU is ready
     output logic [TRANS_ID_BITS-1:0]                commit_tran_id_o,   // transaction id of first commit port
+    output logic                                    commit_acc_o,         // commit the pending accelerator instruction
+    output logic [TRANS_ID_BITS-1:0]                commit_acc_tran_id_o, // transaction id of the last invalid instruction
     output logic                                    amo_valid_commit_o, // valid AMO in commit stage
     input  logic                                    no_st_pending_i,    // there is no store pending
     output logic                                    commit_csr_o,       // commit the pending CSR instruction
@@ -78,10 +81,22 @@ module commit_stage import ariane_pkg::*; #(
       dirty_fp_state_o = 1'b0;
       for (int i = 0; i < NR_COMMIT_PORTS; i++) begin
         dirty_fp_state_o |= commit_ack_o[i] & (commit_instr_i[i].fu inside {FPU, FPU_VEC} || is_rd_fpr(commit_instr_i[i].op));
+        // Check if we issued to Ara a vector floating-point instruction
+        dirty_fp_state_o |= commit_instr_i[i].fu == ACCEL && commit_instr_i[i].vfp;
       end
     end
 
-    assign commit_tran_id_o = commit_instr_i[0].trans_id;
+    // Dirty the V state if we are committing anything related to the vector accelerator
+    always_comb begin : dirty_v_state
+      dirty_v_state_o = 1'b0;
+      for (int i = 0; i < NR_COMMIT_PORTS; i++) begin
+        dirty_v_state_o |= commit_ack_o[i] & (commit_instr_i[i].fu == ACCEL);
+      end
+    end
+
+    assign commit_tran_id_o     = commit_instr_i[0].trans_id;
+    assign commit_acc_tran_id_o = !commit_instr_i[0].valid ? commit_instr_i[0].trans_id
+                                                           : commit_instr_i[1].trans_id;
 
     logic instr_0_is_amo;
     assign instr_0_is_amo = is_amo(commit_instr_i[0].op);
@@ -101,7 +116,8 @@ module commit_stage import ariane_pkg::*; #(
         we_fpr_o           = '{default: 1'b0};
         commit_lsu_o       = 1'b0;
         commit_csr_o       = 1'b0;
-        // amos will commit on port 0
+        commit_acc_o       = 1'b0;
+ 	// amos will commit on port 0
         wdata_o[0]      = (amo_resp_i.ack) ? amo_resp_i.result[riscv::XLEN-1:0] : commit_instr_i[0].result;
         wdata_o[1]      = commit_instr_i[1].result;
         csr_op_o        = ADD; // this corresponds to a CSR NOP
@@ -207,6 +223,18 @@ module commit_stage import ariane_pkg::*; #(
                 we_gpr_o[0] = amo_resp_i.ack;
             end
         end
+
+        // -----------
+        // ACCEL Issue
+        // -----------
+        // Instruction can be issued to the (in-order) back-end if
+        // it reached the top of the scoreboard and it hasn't been
+        // issued yet
+        if (!commit_instr_i[0].valid && commit_instr_i[0].fu == ACCEL)
+            commit_acc_o = 1'b1;
+        if (commit_instr_i[0].valid &&
+            !commit_instr_i[1].valid && commit_instr_i[1].fu == ACCEL)
+            commit_acc_o = 1'b1;
 
         if (NR_COMMIT_PORTS > 1) begin
             // -----------------
